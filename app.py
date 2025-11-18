@@ -1,146 +1,150 @@
 # app.py
-import random
 import math
-import io
-from datetime import datetime
-
-import numpy as np
-import matplotlib.pyplot as plt
-from PIL import Image
+import requests
 import streamlit as st
+from urllib.parse import urlencode
 
-# -------------------------------
-# Streamlit Page Config
-# -------------------------------
-st.set_page_config(
-    page_title="Generative Abstract Poster",
-    page_icon="🎨",
-    layout="wide"
-)
+st.set_page_config(page_title="Museum Collection Search", page_icon="🏛️", layout="wide")
 
-# -------------------------------
-# Utils: palette & blob geometry
-# -------------------------------
-def random_palette(k=6, seed=None):
-    rng = random.Random(seed)
-    return [(rng.random(), rng.random(), rng.random()) for _ in range(k)]
+BASE = "https://collectionapi.metmuseum.org/public/collection/v1"
 
-def blob(center=(0.5, 0.5), r=0.3, points=220, wobble=0.15, seed=None):
-    rng = np.random.default_rng(seed)
-    angles = np.linspace(0, 2*math.pi, points)
-    radii = r * (1 + wobble*(rng.random(points)-0.5))
-    x = center[0] + radii * np.cos(angles)
-    y = center[1] + radii * np.sin(angles)
-    return x, y
+@st.cache_data(ttl=60*60)
+def get_departments():
+    r = requests.get(f"{BASE}/departments", timeout=20)
+    r.raise_for_status()
+    data = r.json().get("departments", [])
+    # 做成 id->name 的映射，和一个选择列表
+    dept_map = {d["departmentId"]: d["displayName"] for d in data}
+    choices = [{"label": d["displayName"], "value": d["departmentId"]} for d in data]
+    return dept_map, choices
 
-def draw_poster(
-    width=800, height=1200, n_layers=6, wobble=0.15, base_r=0.35,
-    seed=None, bg_color=(1,1,1), stroke=False, stroke_alpha=0.7
-):
-    dpi = 100
-    fig_w = width / dpi
-    fig_h = height / dpi
+@st.cache_data(ttl=60)
+def met_search(params: dict):
+    """调用 /search 返回满足条件的 objectIDs 列表"""
+    r = requests.get(f"{BASE}/search", params=params, timeout=30)
+    r.raise_for_status()
+    js = r.json()
+    return js.get("total", 0), js.get("objectIDs", []) or []
 
-    # 单图，不指定配色（遵循要求：不设置特定颜色风格）
-    fig = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
-    ax = plt.axes([0,0,1,1])
-    ax.set_xlim(0,1)
-    ax.set_ylim(0,1)
-    ax.axis('off')
-    ax.set_facecolor(bg_color)
+@st.cache_data(ttl=60*10)
+def get_object(obj_id: int):
+    r = requests.get(f"{BASE}/objects/{obj_id}", timeout=30)
+    r.raise_for_status()
+    return r.json()
 
-    # 随机调色板
-    palette = random_palette(k=n_layers+1, seed=seed)
+def querystring(**kwargs):
+    """把筛选参数转成 querystring，方便展示/分享"""
+    clean = {k:v for k,v in kwargs.items() if v not in (None, "", [], False)}
+    return urlencode(clean, doseq=True)
 
-    # 分层绘制“果冻”形状
-    rng = np.random.default_rng(seed)
-    for i in range(n_layers):
-        cx = rng.uniform(0.3, 0.7)
-        cy = rng.uniform(0.3, 0.7)
-        r = base_r * (1 - i/(n_layers+2)) * rng.uniform(0.85, 1.15)
-        x, y = blob(center=(cx, cy), r=r, wobble=wobble*rng.uniform(0.8,1.2), seed=seed+i)
-        ax.fill(x, y, alpha=0.8, facecolor=palette[i], linewidth=0)
-        if stroke:
-            ax.plot(x, y, alpha=stroke_alpha)
+st.title("🏛️ Museum Collection Search — The Met")
+st.caption("搜索纽约大都会艺术博物馆（The Met）的开放藏品，支持关键词、部门、媒介、年代等筛选。数据来自官方开放 API。")
 
-    # 返回 Pillow Image
-    buf = io.BytesIO()
-    fig.canvas.draw()
-    w, h = fig.canvas.get_width_height()
-    img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
-    plt.close(fig)
-    return Image.fromarray(img)
+# ---------------- Sidebar: Filters ----------------
+dept_map, dept_choices = get_departments()
 
-# -------------------------------
-# Sidebar Controls
-# -------------------------------
-st.sidebar.title("🎛 Controls")
+with st.sidebar:
+    st.header("🔎 搜索与筛选")
+    q = st.text_input("关键词 (q)", value="cat")  # 默认给个例子，便于首次打开有结果
+    colA, colB = st.columns(2)
+    with colA:
+        date_begin = st.number_input("起始年份 (dateBegin)", value=None, placeholder="如 1700 或 -100", step=1, format="%d", label_visibility="visible")
+    with colB:
+        date_end = st.number_input("结束年份 (dateEnd)", value=None, placeholder="如 1800 或 100", step=1, format="%d", label_visibility="visible")
 
-seed = st.sidebar.number_input("Random Seed (可复现)", value=42, step=1)
-canvas_w = st.sidebar.slider("Width (px)", 600, 2000, 900, step=50)
-canvas_h = st.sidebar.slider("Height (px)", 600, 3000, 1400, step=50)
-n_layers = st.sidebar.slider("Layers", 1, 20, 8, step=1)
-wobble = st.sidebar.slider("Wobble (形变强度)", 0.01, 0.60, 0.18, step=0.01)
-base_r = st.sidebar.slider("Base Radius (相对尺寸)", 0.10, 0.60, 0.35, step=0.01)
-stroke = st.sidebar.checkbox("Outline Stroke", value=False)
-stroke_alpha = st.sidebar.slider("Stroke Alpha", 0.1, 1.0, 0.6, step=0.1)
+    dept = st.selectbox("部门 (departmentId)", options=[None] + [c["value"] for c in dept_choices],
+                        format_func=lambda x: "全部部门" if x is None else dept_map[x])
 
-bg_white = st.sidebar.radio("Background", ["White", "Black", "Random"], index=0)
-if bg_white == "White":
-    bg_color = (1,1,1)
-elif bg_white == "Black":
-    bg_color = (0,0,0)
-else:
-    rng_tmp = random.Random(seed)
-    bg_color = (rng_tmp.random(), rng_tmp.random(), rng_tmp.random())
+    has_images = st.checkbox("仅有图片的 (hasImages=true)", value=True)
+    is_highlight = st.checkbox("馆藏精选 (isHighlight=true)", value=False)
+    is_on_view = st.checkbox("目前在展厅展出 (isOnView=true)", value=False)
+    artist_or_culture = st.checkbox("从艺术家或文化字段检索 (artistOrCulture=true)", value=False)
 
-# -------------------------------
-# Main UI
-# -------------------------------
-st.title("🎨 Generative Abstract Poster")
-st.caption("无需外部 API，本地/云端皆可运行。调节参数 → 生成 → 下载 PNG。")
+    medium = st.text_input("媒介 / 类型 (medium)", placeholder="Paintings|Textiles 等，| 分隔可多选")
+    geo = st.text_input("地理位置 (geoLocation)", placeholder="France、China、Paris 等，| 分隔可多选")
+    title_only = st.checkbox("仅在标题中搜 (title=true)", value=False)
+    tags_only = st.checkbox("仅在主题标签中搜 (tags=true)", value=False)
 
-col1, col2 = st.columns([3,2], gap="large")
-
-with col1:
-    if st.button("✨ Generate Poster", type="primary"):
-        st.session_state["poster_img"] = draw_poster(
-            width=canvas_w, height=canvas_h, n_layers=n_layers,
-            wobble=wobble, base_r=base_r, seed=seed,
-            bg_color=bg_color, stroke=stroke, stroke_alpha=stroke_alpha
-        )
-
-    poster = st.session_state.get("poster_img", None)
-    if poster is not None:
-        st.image(poster, caption="Preview", use_container_width=True)
-        # 下载
-        buf = io.BytesIO()
-        poster.save(buf, format="PNG")
-        st.download_button(
-            label="📥 Download PNG",
-            data=buf.getvalue(),
-            file_name=f"poster_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-            mime="image/png"
-        )
-    else:
-        st.info("点击左侧调整参数，然后点 **Generate Poster** 生成预览。")
-
-with col2:
-    st.subheader("Tips")
-    st.markdown(
-        """
-- **Seed** 控制随机数种子：同样的参数 + 同样的 seed → 可复现图像  
-- **Layers** 越多层，效果越丰富  
-- **Wobble** 控制形变程度  
-- **Base Radius** 控制基础半径（越大元素越大）  
-- **Background** 支持白/黑/随机色  
-- **Outline Stroke** 给图形描边  
-        """
-    )
     st.divider()
-    st.subheader("About")
+    page_size = st.select_slider("每页数量", options=[12, 24, 48], value=24)
+    page = st.number_input("页码", min_value=1, value=1, step=1)
+
+# ---------------- Build search params ----------------
+search_params = {"q": q or ""}
+
+# 可选过滤项（Met 搜索支持的参数）
+# 参考官方文档：/search endpoints 的参数
+if has_images: search_params["hasImages"] = "true"
+if is_highlight: search_params["isHighlight"] = "true"
+if is_on_view: search_params["isOnView"] = "true"
+if artist_or_culture: search_params["artistOrCulture"] = "true"
+if title_only: search_params["title"] = "true"
+if tags_only: search_params["tags"] = "true"
+if dept is not None: search_params["departmentId"] = int(dept)
+if medium: search_params["medium"] = medium
+if geo: search_params["geoLocation"] = geo
+# 年代必须成对使用
+if (date_begin is not None) and (date_end is not None):
+    search_params["dateBegin"] = int(date_begin)
+    search_params["dateEnd"] = int(date_end)
+
+# ---------------- Execute search ----------------
+col_left, col_right = st.columns([3, 2], gap="large")
+
+with col_left:
+    run = st.button("🚀 搜索 / 刷新", type="primary")
+    if run or "last_results" not in st.session_state:
+        total, ids = met_search(search_params)
+        st.session_state["last_results"] = {"total": total, "ids": ids, "params": search_params}
+    total = st.session_state["last_results"]["total"]
+    ids = st.session_state["last_results"]["ids"]
+    st.write(f"共找到 **{total}** 件相关藏品。")
+
+    if total == 0 or not ids:
+        st.info("换个关键词或放宽筛选试试～")
+    else:
+        # 简单分页（在 objectIDs 列表上切片）
+        start = (page - 1) * page_size
+        end = min(start + page_size, len(ids))
+        page_ids = ids[start:end]
+
+        # 结果宫格
+        cols = st.columns(3)
+        for i, oid in enumerate(page_ids):
+            data = get_object(oid)
+            with cols[i % 3]:
+                img = data.get("primaryImageSmall") or data.get("primaryImage")
+                title = data.get("title") or "(untitled)"
+                artist = data.get("artistDisplayName") or data.get("culture") or "-"
+                date = data.get("objectDate") or f'{data.get("objectBeginDate","")}-{data.get("objectEndDate","")}'
+                dept_name = data.get("department") or "-"
+                obj_url = data.get("objectURL")  # The Met 官网详情页
+
+                if img:
+                    st.image(img, use_container_width=True)
+                st.markdown(f"**{title}**")
+                st.caption(f"{artist} · {date}\n\n{dept_name}")
+                if obj_url:
+                    st.link_button("详情页（metmuseum.org）", obj_url, type="secondary", use_container_width=True)
+
+        # 分页导航
+        total_pages = max(1, math.ceil(len(ids) / page_size))
+        st.write(f"第 **{page} / {total_pages}** 页（注：API 先返回全部 ID，本页仅显示所选切片）")
+
+with col_right:
+    st.subheader("当前检索参数")
+    st.code(search_params, language="json")
+    st.caption("（Tip）把这些参数记下来，后端可直接复用到 API 请求里。")
+
+    st.subheader("分享链接（仅参数展示）")
+    st.code(querystring(**search_params), language="bash")
+    st.caption("你可以把 querystring 附在自己的说明里，或收藏常用组合。")
+
+st.divider()
+with st.expander("ℹ️ 数据来源与接口说明", expanded=False):
     st.markdown(
         """
-本应用适合作品集、课堂展示、社媒封面。你也可以把生成图作为“舞蹈/时尚品牌视觉元素”海报背景。
+- **The Met Collection API**：无需 API Key，速率建议≤ 80 req/s；提供 `/search`、`/objects/{id}`、`/departments` 等端点。  
+- 本应用流程：先调用 **/search** 得到 `objectIDs` → 根据分页切片逐个调用 **/objects/{id}** 获取详情与图像 URL。  
         """
     )
